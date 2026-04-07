@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <group android:id="@+id/group_main">
+        <item
+            android:id="@+id/nav_settings"
+            android:icon="@drawable/ic_settings"
+            android:title="Settings" />
+    </group>
+    <group android:id="@+id/group_links" android:checkableBehavior="none">
+        <item
+            android:id="@+id/nav_developer"
+            android:icon="@drawable/ic_x_twitter"
+            android:title="@ceorkm on X" />
+        <item
+            android:id="@+id/nav_github"
+            android:icon="@drawable/ic_github"
+            android:title="GitHub" />
+    </group>
+</menu>

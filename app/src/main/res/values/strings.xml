@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Kryon</string>
+    <string name="add_proxy">Add Proxy</string>
+    <string name="edit_proxy">Edit Proxy</string>
+    <string name="no_proxies">No proxies yet\nTap + to add one</string>
+    <string name="developer_url">https://x.com/ceorkm</string>
+    <string name="github_url">https://github.com/ceork</string>
+</resources>

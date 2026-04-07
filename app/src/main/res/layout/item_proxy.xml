@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/cardRoot"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:background="@drawable/bg_card_proxy"
+    android:layout_marginBottom="10dp"
+    android:elevation="1dp"
+    android:clickable="true"
+    android:focusable="true">
+
+    <!-- Main row -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingEnd="8dp"
+        android:paddingVertical="14dp"
+        android:gravity="center_vertical">
+
+        <!-- Country flag -->
+        <TextView
+            android:id="@+id/tvFlag"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:gravity="center"
+            android:textSize="22sp"
+            android:visibility="gone" />
+
+        <!-- Signal icon (hidden when flag is shown) -->
+        <ImageView
+            android:id="@+id/ivSignal"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:src="@drawable/ic_signal"
+            android:padding="6dp"
+            android:background="@drawable/bg_signal_circle" />
+
+        <!-- Name + host (tappable to connect) -->
+        <LinearLayout
+            android:id="@+id/connectArea"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:layout_marginStart="14dp"
+            android:layout_marginEnd="8dp">
+
+            <TextView
+                android:id="@+id/tvName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:textColor="@color/text_primary"
+                android:maxLines="1"
+                android:ellipsize="end" />
+
+            <TextView
+                android:id="@+id/tvHost"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="13sp"
+                android:textColor="@color/text_secondary"
+                android:layout_marginTop="2dp"
+                android:maxLines="1"
+                android:ellipsize="end" />
+
+        </LinearLayout>
+
+        <!-- Timer -->
+        <TextView
+            android:id="@+id/tvTimer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textSize="11sp"
+            android:textColor="@color/primary"
+            android:visibility="gone"
+            android:layout_marginEnd="6dp" />
+
+        <!-- Edit button -->
+        <ImageView
+            android:id="@+id/btnEdit"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:padding="6dp"
+            android:src="@drawable/ic_edit"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Edit" />
+
+        <!-- Delete button -->
+        <ImageView
+            android:id="@+id/btnDelete"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:padding="6dp"
+            android:src="@drawable/ic_delete"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Delete" />
+
+        <!-- Status dot -->
+        <View
+            android:id="@+id/statusDot"
+            android:layout_width="10dp"
+            android:layout_height="10dp"
+            android:background="@drawable/bg_status_disconnected"
+            android:layout_marginStart="6dp" />
+
+    </LinearLayout>
+
+    <!-- Speed stats bar (only visible when connected) -->
+    <LinearLayout
+        android:id="@+id/speedBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingHorizontal="16dp"
+        android:paddingBottom="12dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/tvUpload"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textSize="12sp"
+            android:textColor="@color/primary"
+            android:text="↑ 0 B/s" />
+
+        <TextView
+            android:id="@+id/tvDownload"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textSize="12sp"
+            android:textColor="@color/connected"
+            android:gravity="end"
+            android:text="↓ 0 B/s" />
+
+    </LinearLayout>
+
+</LinearLayout>
