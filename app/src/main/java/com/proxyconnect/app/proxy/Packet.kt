@@ -84,10 +84,11 @@ class Packet(val raw: ByteArray, val length: Int) {
             seqNum: Long, ackNum: Long,
             flags: Int,
             payload: ByteArray = ByteArray(0),
-            window: Int = 65535
+            window: Int = 65535,
+            tcpOptions: ByteArray = ByteArray(0)
         ): ByteArray {
             val ipHdrLen = 20
-            val tcpHdrLen = 20
+            val tcpHdrLen = 20 + tcpOptions.size
             val totalLen = ipHdrLen + tcpHdrLen + payload.size
             val pkt = ByteArray(totalLen)
 
@@ -122,13 +123,18 @@ class Packet(val raw: ByteArray, val length: Int) {
             pkt[ipHdrLen + 9] = (ackNum shr 16).toByte()
             pkt[ipHdrLen + 10] = (ackNum shr 8).toByte()
             pkt[ipHdrLen + 11] = (ackNum and 0xFF).toByte()
-            // Data offset (5 words = 20 bytes)
-            pkt[ipHdrLen + 12] = 0x50.toByte()
+            // Data offset (header length in 4-byte words)
+            pkt[ipHdrLen + 12] = ((tcpHdrLen / 4) shl 4).toByte()
             // Flags
             pkt[ipHdrLen + 13] = flags.toByte()
             // Window
             pkt[ipHdrLen + 14] = (window shr 8).toByte()
             pkt[ipHdrLen + 15] = (window and 0xFF).toByte()
+
+            // TCP options (after fixed 20-byte header)
+            if (tcpOptions.isNotEmpty()) {
+                System.arraycopy(tcpOptions, 0, pkt, ipHdrLen + 20, tcpOptions.size)
+            }
 
             // Payload
             if (payload.isNotEmpty()) {
@@ -139,6 +145,58 @@ class Packet(val raw: ByteArray, val length: Int) {
             val tcpCksum = tcpChecksum(pkt, srcAddr, dstAddr, ipHdrLen, tcpHdrLen + payload.size)
             pkt[ipHdrLen + 16] = (tcpCksum shr 8).toByte()
             pkt[ipHdrLen + 17] = (tcpCksum and 0xFF).toByte()
+
+            return pkt
+        }
+
+        /** SYN-ACK TCP options: MSS 1400, Window Scale 7, SACK Permitted, NOP padding */
+        val SYN_ACK_OPTIONS = byteArrayOf(
+            0x02, 0x04, 0x05, 0x78.toByte(), // MSS = 1400
+            0x01,                              // NOP (padding)
+            0x03, 0x03, 0x07,                  // Window Scale = 7 (window * 128)
+            0x01,                              // NOP (padding)
+            0x01,                              // NOP (padding)
+            0x04, 0x02                         // SACK Permitted
+        )
+
+        /**
+         * Build ICMP Destination Unreachable (Port Unreachable) response.
+         * Tells apps immediately that UDP won't work, forcing instant TCP fallback.
+         */
+        fun buildIcmpUnreachable(originalPacket: ByteArray, originalLength: Int): ByteArray {
+            val ipHdrLen = 20
+            val origIpHdrLen = (originalPacket[0].toInt() and 0xF) * 4
+            val icmpPayloadLen = minOf(origIpHdrLen + 8, originalLength)
+            val icmpLen = 8 + icmpPayloadLen
+            val totalLen = ipHdrLen + icmpLen
+            val pkt = ByteArray(totalLen)
+
+            // IP header
+            pkt[0] = 0x45.toByte()
+            pkt[2] = (totalLen shr 8).toByte()
+            pkt[3] = (totalLen and 0xFF).toByte()
+            pkt[6] = 0x40.toByte() // DF
+            pkt[8] = 64 // TTL
+            pkt[9] = 1  // ICMP
+            // src = original dst, dst = original src
+            System.arraycopy(originalPacket, 16, pkt, 12, 4)
+            System.arraycopy(originalPacket, 12, pkt, 16, 4)
+            val ipCksum = checksum(pkt, 0, ipHdrLen)
+            pkt[10] = (ipCksum shr 8).toByte()
+            pkt[11] = (ipCksum and 0xFF).toByte()
+
+            // ICMP header: Type 3 (Dest Unreachable), Code 3 (Port Unreachable)
+            pkt[ipHdrLen] = 3
+            pkt[ipHdrLen + 1] = 3
+            // bytes 4-7: unused (zero)
+
+            // ICMP payload: original IP header + first 8 bytes of UDP
+            System.arraycopy(originalPacket, 0, pkt, ipHdrLen + 8, icmpPayloadLen)
+
+            // ICMP checksum
+            val icmpCksum = checksum(pkt, ipHdrLen, icmpLen)
+            pkt[ipHdrLen + 2] = (icmpCksum shr 8).toByte()
+            pkt[ipHdrLen + 3] = (icmpCksum and 0xFF).toByte()
 
             return pkt
         }

@@ -141,7 +141,7 @@ class PacketForwarder(
             )
             synchronized(tunOutput) {
                 tunOutput.write(rst)
-                tunOutput.flush()
+                // tunOutput is a raw TUN fd — no buffering, flush is unnecessary
             }
         } catch (_: Exception) {}
     }
@@ -166,7 +166,7 @@ class PacketForwarder(
                     )
                     synchronized(tunOutput) {
                         tunOutput.write(udpResp)
-                        tunOutput.flush()
+                        // tunOutput is a raw TUN fd — no buffering, flush is unnecessary
                     }
                 }
                 // AAAA (IPv6) queries now get an empty NODATA response from buildFakeResponse,
@@ -174,7 +174,16 @@ class PacketForwarder(
             } catch (e: Exception) {
                 Log.e(TAG, "FakeDNS error: ${e.message}")
             }
+        } else {
+            // Non-DNS UDP (QUIC, STUN, etc): send ICMP Port Unreachable so apps
+            // instantly fall back to TCP instead of waiting for a timeout.
+            try {
+                val icmp = Packet.buildIcmpUnreachable(pkt.raw, pkt.length)
+                synchronized(tunOutput) {
+                    tunOutput.write(icmp)
+                    // tunOutput is a raw TUN fd — no buffering, flush is unnecessary
+                }
+            } catch (_: Exception) {}
         }
-        // Non-DNS UDP is dropped (SOCKS5 UDP relay would be needed for full support)
     }
 }

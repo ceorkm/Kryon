@@ -3,30 +3,28 @@ package com.proxyconnect.app.proxy
 import android.net.VpnService
 import android.util.Log
 import com.proxyconnect.app.data.ProxyConfig
+import java.io.BufferedOutputStream
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetSocketAddress
 import java.net.InetAddress
 import java.net.Socket
+import java.util.Base64
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 import kotlin.random.Random
 
 class ProxyException(message: String) : Exception(message)
 
-/**
- * Manages a single TCP connection's full lifecycle through the proxy.
- * Implements the TCP state machine with proper seq/ack tracking.
- *
- * Flow:
- *   Device SYN → connect to proxy → SYN-ACK to device → ESTABLISHED
- *   Device DATA → forward to proxy → ACK to device
- *   Proxy DATA → wrap in TCP → send to device via TUN
- *   Device FIN → FIN-ACK → CLOSED
- */
 class TcpConnection(
     val srcAddr: InetAddress,
     val srcPort: Int,
     val dstAddr: InetAddress,
     val dstPort: Int,
-    val targetHost: String, // Domain name from DNS cache, or raw IP as fallback
+    val targetHost: String,
     private val config: ProxyConfig,
     private val vpnService: VpnService,
     private val tunOutput: FileOutputStream,
@@ -34,40 +32,48 @@ class TcpConnection(
 ) {
     companion object {
         private const val TAG = "TcpConn"
+        private const val MAX_QUEUE_BYTES = 512 * 1024
+        private const val SOCKET_BUFFER_BYTES = 256 * 1024
+        private const val PROXY_STREAM_BUFFER_BYTES = 64 * 1024
+        private const val PROXY_READ_BUFFER_BYTES = 1460
+        private const val WINDOW_SCALE_SHIFT = 7
+        private const val ACK_EVERY_SEGMENTS = 2
+        private const val WINDOW_UPDATE_THRESHOLD_RAW = 256
     }
 
-    enum class State {
-        SYN_RECEIVED,
-        ESTABLISHED,
-        CLOSE_WAIT,
-        CLOSED
+    enum class State { SYN_RECEIVED, ESTABLISHED, CLOSE_WAIT, CLOSED }
+
+    private sealed class WriteCommand {
+        data class Data(val bytes: ByteArray) : WriteCommand()
+        object Finish : WriteCommand()
     }
 
     val key = "${srcAddr.hostAddress}:$srcPort->${dstAddr.hostAddress}:$dstPort"
 
-    @Volatile
-    var state = State.SYN_RECEIVED
-        private set
+    @Volatile var state = State.SYN_RECEIVED; private set
 
-    // Our sequence number (we are the "server" side from the device's perspective)
-    private var mySeq: Long = Random.nextLong(0, 0xFFFFFFFFL) and 0xFFFFFFFFL
-    // What we've acknowledged from the device
+    private var mySeq: Long = Random.nextLong(0, 0x1_0000_0000L)
     private var myAck: Long = 0L
+
     private val seqLock = Any()
+    private val proxyIoLock = Any()
+
+    private val writeQueue = LinkedBlockingQueue<WriteCommand>()
+    private val queuedBytes = AtomicInteger(0)
+    private val pendingAckSegments = AtomicInteger(0)
+    private val lastAdvertisedWindowRaw = AtomicInteger(computeAdvertisedWindowRaw(0))
+    private val closed = AtomicBoolean(false)
+    private val finQueued = AtomicBoolean(false)
 
     private var proxySocket: Socket? = null
+    private var proxyOut: OutputStream? = null
     private var readThread: Thread? = null
+    private var writeThread: Thread? = null
 
-    @Volatile
-    private var closed = false
-
-    /**
-     * Handle the initial SYN from the device.
-     * Connects to the remote destination through the proxy,
-     * then sends SYN-ACK back to the device.
-     */
     fun handleSyn(pkt: Packet) {
-        synchronized(seqLock) { myAck = (pkt.tcpSeqNum + 1) and 0xFFFFFFFFL }
+        synchronized(seqLock) {
+            myAck = (pkt.tcpSeqNum + 1) and 0xFFFFFFFFL
+        }
         state = State.SYN_RECEIVED
 
         Thread {
@@ -76,178 +82,321 @@ class TcpConnection(
 
                 val socket = connectWithAutoDetect(targetHost, dstPort)
                 socket.soTimeout = 0
+                socket.sendBufferSize = SOCKET_BUFFER_BYTES
+                socket.receiveBufferSize = SOCKET_BUFFER_BYTES
 
-                proxySocket = socket
+                synchronized(proxyIoLock) {
+                    proxySocket = socket
+                    proxyOut = BufferedOutputStream(socket.getOutputStream(), PROXY_STREAM_BUFFER_BYTES)
+                }
 
-                // Send SYN-ACK back to device
-                sendToDevice(Packet.FLAG_SYN or Packet.FLAG_ACK)
-                synchronized(seqLock) { mySeq = (mySeq + 1) and 0xFFFFFFFFL } // SYN consumes 1 seq
+                startProxyWriter()
 
-                // Start reading from proxy socket → device
+                val window = lastAdvertisedWindowRaw.get()
+                sendToDevice(
+                    flags = Packet.FLAG_SYN or Packet.FLAG_ACK,
+                    tcpOptions = Packet.SYN_ACK_OPTIONS,
+                    window = window
+                )
+                synchronized(seqLock) {
+                    mySeq = (mySeq + 1) and 0xFFFFFFFFL
+                }
+
                 startProxyReader(socket)
-
             } catch (e: Exception) {
-                Log.e(TAG, "[$key] Proxy connect failed: ${e.message}")
+                Log.e(TAG, "[$key] Proxy connect failed: ${e.message}", e)
                 sendRst()
                 close()
             }
-        }.start()
-    }
-
-    /**
-     * Handle a packet from the device for this connection.
-     */
-    fun handlePacket(pkt: Packet) {
-        if (closed) return
-
-        when {
-            pkt.isRst -> {
-                close()
-            }
-
-            pkt.isFin -> {
-                // Forward any data that arrived with the FIN before closing
-                if (pkt.tcpPayloadLength > 0) {
-                    forwardData(pkt)
-                }
-                synchronized(seqLock) {
-                    myAck = (pkt.tcpSeqNum + pkt.tcpPayloadLength + 1) and 0xFFFFFFFFL
-                }
-                // Send FIN-ACK
-                sendToDevice(Packet.FLAG_FIN or Packet.FLAG_ACK)
-                synchronized(seqLock) { mySeq = (mySeq + 1) and 0xFFFFFFFFL }
-                state = State.CLOSE_WAIT
-                close()
-            }
-
-            pkt.isAck && state == State.SYN_RECEIVED -> {
-                state = State.ESTABLISHED
-                // Handshake complete, forward any data if proxy socket is ready
-                if (pkt.tcpPayloadLength > 0 && proxySocket != null) {
-                    forwardData(pkt)
-                }
-            }
-
-            pkt.tcpPayloadLength > 0 && state == State.ESTABLISHED -> {
-                forwardData(pkt)
-            }
-
-            pkt.isAck -> {
-                // Pure ACK - nothing to do
-            }
+        }.apply {
+            name = "proxy-connect-$key"
+            isDaemon = true
+            start()
         }
     }
 
-    private fun forwardData(pkt: Packet) {
-        val payload = pkt.tcpPayload
-        if (payload.isEmpty()) return
+    fun handlePacket(pkt: Packet) {
+        if (closed.get()) return
 
-        TrafficStats.addUpload(payload.size)
-        synchronized(seqLock) { myAck = (pkt.tcpSeqNum + payload.size.toLong()) and 0xFFFFFFFFL }
-
-        // Forward data to proxy
-        try {
-            proxySocket?.getOutputStream()?.apply {
-                write(payload)
-                flush()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "[$key] Write to proxy failed: ${e.message}")
-            sendRst()
+        if (pkt.isRst) {
             close()
             return
         }
 
-        // ACK the data back to device
-        sendToDevice(Packet.FLAG_ACK)
+        if (pkt.isAck && state == State.SYN_RECEIVED) {
+            state = State.ESTABLISHED
+        }
+
+        if (pkt.tcpPayloadLength > 0) {
+            enqueueData(pkt)
+        }
+
+        if (pkt.isFin) {
+            synchronized(seqLock) {
+                myAck = (pkt.tcpSeqNum + pkt.tcpPayloadLength + 1L) and 0xFFFFFFFFL
+            }
+            pendingAckSegments.set(0)
+            sendToDevice(Packet.FLAG_FIN or Packet.FLAG_ACK, window = currentAdvertisedWindowRaw())
+            synchronized(seqLock) {
+                mySeq = (mySeq + 1) and 0xFFFFFFFFL
+            }
+            state = State.CLOSE_WAIT
+            enqueueFinAfterDrain()
+            return
+        }
+
+        if (pkt.tcpPayloadLength > 0 && state != State.CLOSED) {
+            val queueWindowChanged = maybeSendWindowUpdate(fromWriter = false)
+            val segmentCount = pendingAckSegments.incrementAndGet()
+            if (pkt.isPsh || segmentCount >= ACK_EVERY_SEGMENTS) {
+                pendingAckSegments.set(0)
+                sendAckWithWindow()
+            } else if (queueWindowChanged) {
+                pendingAckSegments.set(0)
+            }
+        }
     }
 
-    /**
-     * Read data from the proxy socket and send it back to the device as TCP segments.
-     */
+    private fun enqueueData(pkt: Packet) {
+        val payload = pkt.tcpPayload
+        if (payload.isEmpty() || closed.get()) return
+
+        if (!writeQueue.offer(WriteCommand.Data(payload))) {
+            throw IllegalStateException("Write queue rejected payload for $key")
+        }
+
+        queuedBytes.addAndGet(payload.size)
+        TrafficStats.addUpload(payload.size)
+
+        synchronized(seqLock) {
+            myAck = (pkt.tcpSeqNum + payload.size.toLong()) and 0xFFFFFFFFL
+        }
+    }
+
+    private fun enqueueFinAfterDrain() {
+        if (closed.get()) return
+        if (finQueued.compareAndSet(false, true)) {
+            if (!writeQueue.offer(WriteCommand.Finish)) {
+                throw IllegalStateException("Write queue rejected FIN sentinel for $key")
+            }
+        }
+    }
+
+    private fun startProxyWriter() {
+        writeThread = Thread {
+            try {
+                while (!closed.get()) {
+                    val command = writeQueue.take()
+                    when (command) {
+                        is WriteCommand.Data -> {
+                            val sawFinish = writeBatch(command)
+                            maybeSendWindowUpdate(fromWriter = true)
+                            if (sawFinish) {
+                                close()
+                                return@Thread
+                            }
+                        }
+
+                        WriteCommand.Finish -> {
+                            flushProxyOutput()
+                            close()
+                            return@Thread
+                        }
+                    }
+                }
+            } catch (_: InterruptedException) {
+                // close() interrupts the writer to unblock take()/write shutdown.
+            } catch (e: Exception) {
+                if (!closed.get()) {
+                    Log.e(TAG, "[$key] Proxy write error: ${e.message}", e)
+                    sendRst()
+                    close()
+                }
+            }
+        }.apply {
+            name = "proxy-write-$key"
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun writeBatch(first: WriteCommand.Data): Boolean {
+        var sawFinish = false
+        synchronized(proxyIoLock) {
+            val out = proxyOut ?: return true
+            out.write(first.bytes)
+            queuedBytes.addAndGet(-first.bytes.size)
+
+            while (true) {
+                val next = writeQueue.poll() ?: break
+                if (next is WriteCommand.Data) {
+                    out.write(next.bytes)
+                    queuedBytes.addAndGet(-next.bytes.size)
+                } else {
+                    sawFinish = true
+                    break
+                }
+            }
+            out.flush()
+        }
+        return sawFinish
+    }
+
     private fun startProxyReader(socket: Socket) {
         readThread = Thread {
             try {
                 val input = socket.getInputStream()
-                val buffer = ByteArray(1400)
+                val buffer = ByteArray(PROXY_READ_BUFFER_BYTES)
 
-                while (!closed && !socket.isClosed) {
+                while (!closed.get() && !socket.isClosed) {
                     val n = input.read(buffer)
                     if (n <= 0) break
 
                     val data = buffer.copyOfRange(0, n)
-                    sendToDevice(Packet.FLAG_ACK or Packet.FLAG_PSH, data)
-                    synchronized(seqLock) { mySeq = (mySeq + n) and 0xFFFFFFFFL }
+                    sendToDevice(Packet.FLAG_ACK or Packet.FLAG_PSH, data, window = currentAdvertisedWindowRaw())
+                    synchronized(seqLock) {
+                        mySeq = (mySeq + n) and 0xFFFFFFFFL
+                    }
                 }
 
-                // Proxy closed the connection - send FIN to device
-                if (!closed) {
-                    sendToDevice(Packet.FLAG_FIN or Packet.FLAG_ACK)
-                    synchronized(seqLock) { mySeq = (mySeq + 1) and 0xFFFFFFFFL }
+                if (!closed.get()) {
+                    sendToDevice(Packet.FLAG_FIN or Packet.FLAG_ACK, window = currentAdvertisedWindowRaw())
+                    synchronized(seqLock) {
+                        mySeq = (mySeq + 1) and 0xFFFFFFFFL
+                    }
                 }
-
             } catch (e: Exception) {
-                if (!closed) {
-                    Log.e(TAG, "[$key] Proxy read error: ${e.message}")
+                if (!closed.get()) {
+                    Log.e(TAG, "[$key] Proxy read error: ${e.message}", e)
+                    sendRst()
                 }
             } finally {
                 close()
             }
+        }.apply {
+            name = "proxy-read-$key"
+            isDaemon = true
+            start()
         }
-        readThread?.name = "proxy-read-$key"
-        readThread?.isDaemon = true
-        readThread?.start()
     }
 
-    /**
-     * Send a TCP packet back to the device through the TUN interface.
-     * The src/dst are SWAPPED (we're the remote server responding).
-     */
-    private fun sendToDevice(flags: Int, payload: ByteArray = ByteArray(0)) {
-        val flagStr = buildString {
-            if (flags and Packet.FLAG_SYN != 0) append("SYN ")
-            if (flags and Packet.FLAG_ACK != 0) append("ACK ")
-            if (flags and Packet.FLAG_PSH != 0) append("PSH ")
-            if (flags and Packet.FLAG_FIN != 0) append("FIN ")
-            if (flags and Packet.FLAG_RST != 0) append("RST ")
-        }
+    private fun currentAdvertisedWindowRaw(): Int {
+        val raw = computeAdvertisedWindowRaw(queuedBytes.get())
+        lastAdvertisedWindowRaw.set(raw)
+        return raw
+    }
+
+    private fun computeAdvertisedWindowRaw(queued: Int): Int {
+        val available = (MAX_QUEUE_BYTES - queued).coerceAtLeast(0)
+        return (available shr WINDOW_SCALE_SHIFT).coerceIn(0, 0xFFFF)
+    }
+
+    private fun maybeSendWindowUpdate(fromWriter: Boolean): Boolean {
+        if (closed.get()) return false
+
+        val next = computeAdvertisedWindowRaw(queuedBytes.get())
+        val previous = lastAdvertisedWindowRaw.get()
+        if (!shouldSendWindowUpdate(previous, next, fromWriter)) return false
+        if (!lastAdvertisedWindowRaw.compareAndSet(previous, next)) return false
+
+        sendToDevice(Packet.FLAG_ACK, window = next)
+        return true
+    }
+
+    private fun shouldSendWindowUpdate(previous: Int, next: Int, fromWriter: Boolean): Boolean {
+        if (next == previous) return false
+        if (next == 0 || previous == 0) return true
+
+        val delta = abs(next - previous)
+        if (delta >= WINDOW_UPDATE_THRESHOLD_RAW) return true
+
+        return if (fromWriter) next > previous && queuedBytes.get() <= MAX_QUEUE_BYTES / 2
+        else next < previous && queuedBytes.get() >= MAX_QUEUE_BYTES / 2
+    }
+
+    private fun sendAckWithWindow() {
+        sendToDevice(Packet.FLAG_ACK, window = currentAdvertisedWindowRaw())
+    }
+
+    private fun sendToDevice(
+        flags: Int,
+        payload: ByteArray = ByteArray(0),
+        tcpOptions: ByteArray = ByteArray(0),
+        window: Int = currentAdvertisedWindowRaw()
+    ) {
         val (seq, ack) = synchronized(seqLock) { mySeq to myAck }
-        Log.d(TAG, "[$key] -> device: ${flagStr.trim()} seq=$seq ack=$ack len=${payload.size}")
         try {
-            val pkt = Packet.buildTcpPacket(
-                srcAddr = dstAddr, srcPort = dstPort,  // We are the "server"
-                dstAddr = srcAddr, dstPort = srcPort,  // Device is the "client"
+            val packet = Packet.buildTcpPacket(
+                srcAddr = dstAddr,
+                srcPort = dstPort,
+                dstAddr = srcAddr,
+                dstPort = srcPort,
                 seqNum = seq,
                 ackNum = ack,
                 flags = flags,
-                payload = payload
+                payload = payload,
+                window = window,
+                tcpOptions = tcpOptions
             )
             synchronized(tunOutput) {
-                tunOutput.write(pkt)
-                tunOutput.flush()
+                tunOutput.write(packet)
+                // tunOutput is a raw TUN fd — no buffering, flush is unnecessary.
             }
-            if (payload.isNotEmpty()) TrafficStats.addDownload(payload.size)
+            if (payload.isNotEmpty()) {
+                TrafficStats.addDownload(payload.size)
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "[$key] TUN write failed: ${e.message}")
+            if (!closed.get()) {
+                Log.e(TAG, "[$key] TUN write failed: ${e.message}", e)
+            }
+        }
+    }
+
+    private fun flushProxyOutput() {
+        synchronized(proxyIoLock) {
+            try {
+                proxyOut?.flush()
+            } catch (_: Exception) {
+            }
         }
     }
 
     private fun sendRst() {
         try {
-            sendToDevice(Packet.FLAG_RST or Packet.FLAG_ACK)
-        } catch (_: Exception) {}
+            sendToDevice(Packet.FLAG_RST or Packet.FLAG_ACK, window = currentAdvertisedWindowRaw())
+        } catch (_: Exception) {
+        }
     }
 
-    /**
-     * Auto-detect proxy protocol. Tries protocols in order:
-     * - If a protocol was previously detected, try that first.
-     * - Otherwise try: HTTP → HTTPS → SOCKS5
-     * - Cache the working protocol for future connections.
-     */
+    fun close() {
+        if (!closed.compareAndSet(false, true)) return
+
+        state = State.CLOSED
+        pendingAckSegments.set(0)
+        queuedBytes.set(0)
+        writeQueue.clear()
+
+        synchronized(proxyIoLock) {
+            try {
+                proxyOut?.flush()
+            } catch (_: Exception) {
+            }
+            try {
+                proxySocket?.close()
+            } catch (_: Exception) {
+            }
+            proxyOut = null
+            proxySocket = null
+        }
+
+        writeThread?.interrupt()
+        readThread?.interrupt()
+        onClose(key)
+    }
+
     private fun connectWithAutoDetect(targetHost: String, targetPort: Int): Socket {
         val cached = config.detectedProtocol
         val protocols = if (cached != ProxyConfig.ProxyProtocol.UNKNOWN) {
-            // Try cached first, then the rest
             listOf(cached) + listOf(
                 ProxyConfig.ProxyProtocol.HTTP,
                 ProxyConfig.ProxyProtocol.HTTPS,
@@ -267,69 +416,80 @@ class TcpConnection(
             var socket: Socket? = null
             var sslSocket: javax.net.ssl.SSLSocket? = null
             try {
-                socket = Socket()
+                socket = Socket().apply {
+                    keepAlive = true
+                    sendBufferSize = SOCKET_BUFFER_BYTES
+                    receiveBufferSize = SOCKET_BUFFER_BYTES
+                }
                 vpnService.protect(socket)
 
                 if (proto == ProxyConfig.ProxyProtocol.HTTPS) {
-                    // For HTTPS proxy, wrap in SSL before HTTP CONNECT
-                    socket.connect(java.net.InetSocketAddress(config.host, config.port), 10_000)
+                    socket.connect(InetSocketAddress(config.host, config.port), 10_000)
                     socket.soTimeout = 10_000
+
                     val sslContext = javax.net.ssl.SSLContext.getInstance("TLS")
                     sslContext.init(null, arrayOf(TrustAllManager()), null)
                     sslSocket = sslContext.socketFactory.createSocket(
-                        socket, config.host, config.port, true
+                        socket,
+                        config.host,
+                        config.port,
+                        true
                     ) as javax.net.ssl.SSLSocket
                     vpnService.protect(sslSocket)
                     sslSocket.soTimeout = 10_000
+                    sslSocket.sendBufferSize = SOCKET_BUFFER_BYTES
+                    sslSocket.receiveBufferSize = SOCKET_BUFFER_BYTES
+
                     httpConnectHandshake(sslSocket, targetHost, targetPort)
                     Log.i(TAG, "[$key] Connected via HTTPS proxy")
-                    ProxyConfig.saveDetectedProtocol(vpnService as android.content.Context, proto)
+                    ProxyConfig.saveDetectedProtocol(vpnService, proto)
                     return sslSocket
-                } else {
-                    socket.connect(java.net.InetSocketAddress(config.host, config.port), 10_000)
-                    socket.soTimeout = 10_000
-                    socket.keepAlive = true
-
-                    when (proto) {
-                        ProxyConfig.ProxyProtocol.SOCKS5 -> socks5Handshake(socket, targetHost, targetPort)
-                        ProxyConfig.ProxyProtocol.HTTP -> httpConnectHandshake(socket, targetHost, targetPort)
-                        else -> {}
-                    }
-
-                    Log.i(TAG, "[$key] Connected via ${proto.name} proxy")
-                    ProxyConfig.saveDetectedProtocol(vpnService as android.content.Context, proto)
-                    return socket
                 }
+
+                socket.connect(InetSocketAddress(config.host, config.port), 10_000)
+                socket.soTimeout = 10_000
+
+                when (proto) {
+                    ProxyConfig.ProxyProtocol.SOCKS5 -> socks5Handshake(socket, targetHost, targetPort)
+                    ProxyConfig.ProxyProtocol.HTTP -> httpConnectHandshake(socket, targetHost, targetPort)
+                    else -> Unit
+                }
+
+                Log.i(TAG, "[$key] Connected via ${proto.name} proxy")
+                ProxyConfig.saveDetectedProtocol(vpnService, proto)
+                return socket
             } catch (e: Exception) {
                 Log.w(TAG, "[$key] ${proto.name} failed: ${e.message}")
                 lastError = e
-                try { sslSocket?.close() } catch (_: Exception) {}
-                try { socket?.close() } catch (_: Exception) {}
+                try {
+                    sslSocket?.close()
+                } catch (_: Exception) {
+                }
+                try {
+                    socket?.close()
+                } catch (_: Exception) {
+                }
             }
         }
 
         throw lastError ?: ProxyException("All proxy protocols failed")
     }
 
-    /** Trust-all manager for HTTPS proxies with self-signed certs */
     private class TrustAllManager : javax.net.ssl.X509TrustManager {
-        override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>?, authType: String?) {}
-        override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>?, authType: String?) {}
+        override fun checkClientTrusted(
+            chain: Array<java.security.cert.X509Certificate>?,
+            authType: String?
+        ) {
+        }
+
+        override fun checkServerTrusted(
+            chain: Array<java.security.cert.X509Certificate>?,
+            authType: String?
+        ) {
+        }
+
         override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
     }
-
-    fun close() {
-        if (closed) return
-        closed = true
-        state = State.CLOSED
-
-        try { proxySocket?.close() } catch (_: Exception) {}
-        proxySocket = null
-
-        onClose(key)
-    }
-
-    // ---- SOCKS5 handshake (duplicated here to use pre-protected socket) ----
 
     private fun socks5Handshake(socket: Socket, targetHost: String, targetPort: Int) {
         val output = socket.getOutputStream()
@@ -344,13 +504,16 @@ class TcpConnection(
         output.flush()
 
         val greeting = readBytes(input, 2)
-        if (greeting[0] != 0x05.toByte()) throw ProxyException("Bad SOCKS5 greeting")
+        if (greeting[0] != 0x05.toByte()) {
+            throw ProxyException("Bad SOCKS5 greeting")
+        }
 
         if (greeting[1] == 0x02.toByte()) {
             val user = config.username.toByteArray()
             val pass = config.password.toByteArray()
             if (user.size > 255) throw ProxyException("SOCKS5 username too long (max 255 bytes)")
             if (pass.size > 255) throw ProxyException("SOCKS5 password too long (max 255 bytes)")
+
             val auth = ByteArray(3 + user.size + pass.size)
             auth[0] = 0x01
             auth[1] = user.size.toByte()
@@ -359,16 +522,23 @@ class TcpConnection(
             System.arraycopy(pass, 0, auth, 3 + user.size, pass.size)
             output.write(auth)
             output.flush()
+
             val authResp = readBytes(input, 2)
-            if (authResp[1] != 0x00.toByte()) throw ProxyException("SOCKS5 auth failed")
+            if (authResp[1] != 0x00.toByte()) {
+                throw ProxyException("SOCKS5 auth failed")
+            }
         } else if (greeting[1] != 0x00.toByte()) {
             throw ProxyException("SOCKS5 no acceptable auth")
         }
 
         val domain = targetHost.toByteArray()
         if (domain.size > 255) throw ProxyException("Domain too long")
+
         val req = ByteArray(7 + domain.size)
-        req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03
+        req[0] = 0x05
+        req[1] = 0x01
+        req[2] = 0x00
+        req[3] = 0x03
         req[4] = (domain.size and 0xFF).toByte()
         System.arraycopy(domain, 0, req, 5, domain.size)
         req[5 + domain.size] = (targetPort shr 8).toByte()
@@ -377,12 +547,18 @@ class TcpConnection(
         output.flush()
 
         val resp = readBytes(input, 4)
-        if (resp[1] != 0x00.toByte()) throw ProxyException("SOCKS5 connect failed: ${resp[1]}")
+        if (resp[1] != 0x00.toByte()) {
+            throw ProxyException("SOCKS5 connect failed: ${resp[1]}")
+        }
 
-        when (resp[3].toInt()) {
-            0x01 -> readBytes(input, 6)   // IPv4 + port
-            0x03 -> { val len = input.read(); if (len < 0) throw ProxyException("EOF during SOCKS5 bind addr"); readBytes(input, len + 2) } // domain + port
-            0x04 -> readBytes(input, 18)  // IPv6 + port
+        when (resp[3].toInt() and 0xFF) {
+            0x01 -> readBytes(input, 6)
+            0x03 -> {
+                val len = input.read()
+                if (len < 0) throw ProxyException("EOF during SOCKS5 bind addr")
+                readBytes(input, len + 2)
+            }
+            0x04 -> readBytes(input, 18)
         }
     }
 
@@ -390,32 +566,38 @@ class TcpConnection(
         val output = socket.getOutputStream()
         val input = socket.getInputStream()
 
-        val sb = StringBuilder()
-        sb.append("CONNECT $targetHost:$targetPort HTTP/1.1\r\n")
-        sb.append("Host: $targetHost:$targetPort\r\n")
-        if (config.username.isNotBlank()) {
-            val cred = "${config.username}:${config.password}"
-            val enc = java.util.Base64.getEncoder().encodeToString(cred.toByteArray())
-            sb.append("Proxy-Authorization: Basic $enc\r\n")
+        val request = buildString {
+            append("CONNECT $targetHost:$targetPort HTTP/1.1\r\n")
+            append("Host: $targetHost:$targetPort\r\n")
+            if (config.username.isNotBlank()) {
+                val cred = "${config.username}:${config.password}"
+                val enc = Base64.getEncoder().encodeToString(cred.toByteArray())
+                append("Proxy-Authorization: Basic $enc\r\n")
+            }
+            append("\r\n")
         }
-        sb.append("\r\n")
-        output.write(sb.toString().toByteArray())
+
+        output.write(request.toByteArray())
         output.flush()
 
-        val line = readLine(input)
-        if (!(line.startsWith("HTTP/") && line.split(" ").getOrNull(1) == "200")) throw ProxyException("HTTP CONNECT failed: $line")
-        while (readLine(input).isNotBlank()) { /* skip headers */ }
+        val statusLine = readLine(input)
+        if (!(statusLine.startsWith("HTTP/") && statusLine.split(" ").getOrNull(1) == "200")) {
+            throw ProxyException("HTTP CONNECT failed: $statusLine")
+        }
+        while (readLine(input).isNotBlank()) {
+            // Skip proxy response headers.
+        }
     }
 
     private fun readBytes(input: InputStream, count: Int): ByteArray {
-        val buf = ByteArray(count)
-        var off = 0
-        while (off < count) {
-            val n = input.read(buf, off, count - off)
+        val buffer = ByteArray(count)
+        var offset = 0
+        while (offset < count) {
+            val n = input.read(buffer, offset, count - offset)
             if (n < 0) throw ProxyException("EOF during read")
-            off += n
+            offset += n
         }
-        return buf
+        return buffer
     }
 
     private fun readLine(input: InputStream): String {
